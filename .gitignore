@@ -2,4 +2,3 @@ _local/
 __pycache__/
 *.pyc
 bench/job_blackwell.py
-media/

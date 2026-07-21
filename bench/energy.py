@@ -41,8 +41,8 @@ def measure(fn, seconds=8.0):
     calls = 0
     while time.perf_counter() - t0 < seconds:
         fn()
+        torch.cuda.synchronize()
         calls += 1
-    torch.cuda.synchronize()
     el = time.perf_counter() - t0
     stop.set()
     th.join()

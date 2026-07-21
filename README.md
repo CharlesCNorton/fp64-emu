@@ -319,6 +319,19 @@ from 1.43 s to 0.94 s, a 1.5x end-to-end speedup; consumer Ampere at
 `n = 8192` moves from 0.83 s to 0.56 s. The factorization residuals are
 equal between the two engines at 3 - 4 x 10^-16.
 
+## Energy
+
+Mean board power over a sustained loop at `n = 8192` (`bench/energy.py`).
+The emulation draws more power than throttled FP64 but finishes 10 to 16
+times sooner, so it delivers 6 to 11 times more work per joule.
+
+| part | engine | ms/GEMM | W | J/GEMM | GFLOP/J |
+|---|---|---|---|---|---|
+| RTX 6000 Ada | native | 840.0 | 180.5 | 151.6 | 7.3 |
+| RTX 6000 Ada | default | 83.2 | 297.3 | 24.7 | 44.5 |
+| RTX 3070 Ti | native | 3907.4 | 77.9 | 304.5 | 3.6 |
+| RTX 3070 Ti | default | 250.8 | 114.5 | 28.7 | 38.3 |
+
 ## Requirements and limits
 
 - NVIDIA GPU with compute capability 8.0 or higher, verified on 8.0, 8.6,

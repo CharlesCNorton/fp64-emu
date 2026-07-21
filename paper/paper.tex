@@ -1010,16 +1010,37 @@ $3$ to $4 \times 10^{-16}$.
 
 \subsection{Energy}\label{sec:energy}
 
-Board power sampled by \code{nvidia-smi} during sustained loops converts
-the throughput advantage into an energy one. On Ada at $n = 8192$,
-native FP64 draws 180 W for 840 ms per product, 151.6 J per GEMM, while
-the default configuration draws 297 W for 83 ms, 24.7 J per GEMM: the
-emulation pulls 65 percent more power and finishes ten times sooner, so
-it is $6.1\times$ more energy-efficient, 44.5 against 7.3 GFLOP per
-joule. The asymmetry in draw is itself informative: the throttled FP64
-pipe cannot fill the machine and leaves the board underdrawn, while the
-emulation runs the tensor cores at the full power envelope and still
-wins on energy by finishing an order of magnitude sooner.
+Throughput converts into energy through board power, which we sample by
+repeated \code{nvidia-smi} queries throughout a sustained loop on the two
+locally held parts (Table~\ref{tab:energy}). The per-product times
+reproduce Table~\ref{tab:native} to within two percent, so the two
+harnesses measure the same quantity.
+
+\begin{table}[t]
+\centering
+\caption{Energy per product at $n = 8192$: mean board power over a
+sustained loop, and the resulting joules per GEMM.}
+\label{tab:energy}
+\begin{tabular}{llrrrr}
+\toprule
+part & engine & ms & W & J & GFLOP/J \\
+\midrule
+RTX 6000 Ada & native & 840.0 & 180.5 & 151.6 & 7.3 \\
+ & default & 83.2 & 297.3 & 24.7 & 44.5 \\
+consumer Ampere & native & 3907.4 & 77.9 & 304.5 & 3.6 \\
+ & default & 250.8 & 114.5 & 28.7 & 38.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The emulation draws more power on both parts, 65 percent more on Ada and
+47 percent more on consumer Ampere, and finishes 10 to 16 times sooner,
+so it delivers $6.1\times$ and $10.6\times$ more work per joule
+respectively. The direction of the power gap is itself a statement about
+the hardware: a throttled FP64 pipe cannot occupy the machine, leaving
+the board drawing well under its envelope, while the residue pipeline
+runs the tensor cores at full draw and still wins on energy by finishing
+an order of magnitude sooner.
 
 \subsection{NVIDIA's cuBLAS FP64 emulation}\label{sec:cublasemu}
 

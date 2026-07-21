@@ -6,6 +6,8 @@
 \usepackage{booktabs}
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta,positioning}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
 \usepackage[margin=1in]{geometry}
 \usepackage{microtype}
 \usepackage[hidelinks]{hyperref}
@@ -35,36 +37,29 @@
 Most consumer and workstation GPUs execute double-precision arithmetic at
 one sixty-fourth of their single-precision rate, while their INT8 tensor
 cores are the fastest units on the die. We present RARE, range-adaptive
-residue emulation, implemented in the open library \fpemu{}: a
-double-precision matrix multiplication that runs on those integer units
-through the residue arithmetic of the Ozaki-II scheme: operands are scaled
-to exact integers, multiplied modulo a set of pairwise-coprime moduli, one
-INT8 GEMM per modulus, and the exact product is recovered by the Chinese
-Remainder Theorem. On top of this scheme we contribute a runtime
-Cauchy--Schwarz sizing pass that measures the operands and converts unused
-residue range into operand precision, so that every modulus count is safe
-and adversarial input narrows the result instead of corrupting it; an
-extraction pass that runs entirely in integer arithmetic on the raw
-floating-point encoding, with round-to-nearest splitting and a first-order
-quantization correction carried by two additional INT8 GEMMs; a
-reconstruction that computes balanced mixed-radix digits with packed
-byte-dot-product instructions entirely in registers; and a fused
-tensor-core engine whose epilogue reduces every product to a one-byte
-balanced residue, dispatched against cuBLAS by measured per-shape timing
-rather than architectural guesswork. Measured on five NVIDIA architectures
-spanning Ampere to Blackwell, \fpemu{} exceeds native FP64 by up to a
-factor of 26 on the parts whose FP64 units are throttled, and at equal
-GEMM counts it exceeds \gemmul{}, the reference implementation published
-by the scheme's authors, at every size on every such part, by factors
-between 1.07 and 3.80; on datacenter silicon with unthrottled FP64,
-emulation of either flavor pays only at the largest sizes, and there
-\gemmul{} leads. A tiled Cholesky factorization that routes its trailing
-updates through the batched entry point runs 1.5 times faster end to end
-at equal residuals. Accuracy exceeds native DGEMM in every distribution
-tested, and on exactly representable inputs the product is reproduced bit
-for bit, a property verified against integer oracles at depths to
-$K = 200{,}000$. The implementation, including batched and transpose-free
-entry points, is publicly available.
+residue emulation, implemented in the open library \fpemu{}:
+double-precision matrix multiplication executed as one INT8 GEMM per
+pairwise-coprime modulus and recovered exactly through the Chinese
+Remainder Theorem, following the Ozaki-II scheme. A runtime
+Cauchy--Schwarz pass measures the operands and converts unused residue
+range into operand precision, making every modulus count range-safe;
+extraction runs entirely in integer arithmetic with round-to-nearest
+splitting, and two additional INT8 GEMMs cancel the first-order
+quantization error; reconstruction computes balanced mixed-radix digits
+with packed byte dot products held in registers; and a fused tensor-core
+engine reduces every product to a one-byte residue in its epilogue,
+dispatched against cuBLAS by measured per-shape timing. We prove range
+safety, bit-exactness on representable inputs, and a worst-case error
+bound that quantifies the correction. Measured on five NVIDIA
+architectures, \fpemu{} exceeds native FP64 by up to a factor of 26 on
+the FP64-throttled parts and exceeds \gemmul{}, the scheme authors'
+reference implementation, at every size on every such part at equal GEMM
+counts, by 1.07 to 3.80 times; on unthrottled datacenter silicon,
+emulation pays only at scale, and there \gemmul{} leads. A tiled Cholesky
+factorization routing its trailing updates through the batched entry
+point runs 1.5 times faster end to end at equal residuals. Accuracy
+exceeds native DGEMM in every distribution tested, with exactness
+verified against integer oracles to depth $200{,}000$.
 \end{abstract}
 
 \maketitle
@@ -76,11 +71,10 @@ scientific computing asks for. A current consumer or workstation GPU
 executes IEEE double precision at $1/64$ of its single-precision rate: an
 RTX 6000 Ada sustains roughly $1.3$ TFLOP/s in FP64 against hundreds of
 tera-operations per second on its INT8 tensor cores, and the recent
-Blackwell workstation parts widen this ratio further. The hardware trend is
-not accidental. Deep learning workloads, which dominate the economics of
-GPU design, need low-precision matrix engines, and double-precision units
-survive at full rate only on a shrinking set of datacenter parts. For the
-large community computing on everything else, double-precision matrix
+Blackwell workstation parts widen this ratio further. Deep learning
+workloads dominate the economics of GPU design, and full-rate
+double-precision units survive only on a shrinking set of datacenter
+parts. For the large community computing on everything else, double-precision matrix
 multiplication is effectively a legacy path executed at a small fraction of
 the machine's capability.
 
@@ -245,7 +239,8 @@ measured comparison of Section~\ref{sec:eval} situates our contribution.
 
 \section{The Pipeline}\label{sec:method}
 
-Figure~\ref{fig:pipeline} shows the five phases of \fpemu{}. This section
+Figure~\ref{fig:pipeline} shows the five phases of RARE as implemented in
+\fpemu{}. This section
 walks through the numerically substantive ones: the sizing pass that
 chooses the operand width, the extraction that produces residues and
 correction operands, and the reconstruction. Section~\ref{sec:engine}
@@ -443,19 +438,119 @@ replaces the 128-bit combine with one in double precision, trading the
 last bit of the accumulator for a few percent of the phase; both paths
 keep the recombination off the throttled native-FP64 pipe.
 
-\begin{remark}
-When every element of
-$A$ and $B$ is exactly representable at its row or column scale, the
-residuals vanish, the reconstructed integer is the true product, and the
-output is bit-identical to exact arithmetic whenever each inner product
-fits the range; our test suite verifies this by \code{torch.equal} against
-integer oracles, including random integer matrices, the aligned all-ones
-case, a dyadic case with per-column scales spanning $2^{-12}$ to $2^{0}$,
-and, through the segmented path of Section~\ref{sec:extensions}, depths to
-$K = 200{,}000$. On general inputs the exact path returns the correctly
-rounded double of the reconstructed corrected product, whose distance from
-the true real product is set by the second-order term $r_A r_B$ alone.
-\end{remark}
+\subsection{Guarantees}\label{sec:guarantees}
+
+The pipeline's numerical claims reduce to three statements: the sizing
+pass never admits a product that wraps the residue range, the arithmetic
+between extraction and output is exact, and the correction bounds the
+error on general inputs. We state and prove them here; throughout,
+$b_e$ denotes the effective operand width, $\sigma_i$ and $\tau_j$ the
+per-row and per-column shifts after widening,
+$\tilde{a}_{ik} = \mathrm{round}(a_{ik} 2^{\sigma_i})$ with residual
+$r^A_{ik} = a_{ik} 2^{\sigma_i} - \tilde{a}_{ik}$, $|r^A_{ik}| \le
+\tfrac12$, and $P = \tilde{A} \tilde{B}^{\top}$ the exact integer
+product. $M^{*} = \min(\prod_t m_t,\, 2^{126})$ is the capped range.
+
+\begin{proposition}[Range safety]\label{prop:range}
+Let $b_e \ge 16$ and $K \le 2^{23}$, and suppose the widening pass
+accepts the shift under its half-bit margin, that is,
+$\lambda_A + \lambda_B + \tfrac12 \le \log_2 M^{*} - 1$, where
+$\lambda_A$ is the computed value of
+$\max_i \log_2 \| a_{i,:} 2^{\sigma_i} \|_2$ and likewise $\lambda_B$.
+Then $|P_{ij}| < M^{*}/2$ for all $i, j$: the balanced CRT representative
+of every output element is $P_{ij}$ itself, and the 128-bit recombination
+cannot overflow.
+\end{proposition}
+
+\begin{proof}
+By Cauchy--Schwarz, $|P_{ij}| \le \|\tilde{a}_{i,:}\|_2
+\|\tilde{b}_{:,j}\|_2$. Rounding perturbs each row norm by at most
+$\tfrac{\sqrt{K}}{2}$ in absolute terms, and the scaled row maximum is at
+least $2^{b_e - 1}$, so
+$\|\tilde{a}_{i,:}\|_2 \le \|a_{i,:} 2^{\sigma_i}\|_2 (1 + \sqrt{K}\,
+2^{-b_e})$, an inflation of at most $\log_2(1 + 2^{11.5 - 16}) < 0.064$
+bits under the stated hypotheses, and likewise for columns. The norm
+itself is accumulated in binary64, whose relative error over at most $K$
+terms is below $2^{-30}$, and stored in binary32, contributing less than
+$2^{-15}$ bits; the shifts are powers of two and perturb nothing. The
+total slack on the left-hand side is therefore below
+$2 \cdot 0.064 + 2^{-14} < \tfrac12$, so the true bound satisfies
+$\log_2 (\|\tilde{a}_{i,:}\| \|\tilde{b}_{:,j}\|) \le \lambda_A +
+\lambda_B + \tfrac12 \le \log_2 M^{*} - 1$.
+\end{proof}
+
+\begin{proposition}[Exactness]\label{prop:exact}
+Under Proposition~\ref{prop:range}, the exact path returns
+$\mathrm{RN}\bigl(2^{-\sigma_i - \tau_j} (P_{ij} + 2^{b_e - 15}
+\Delta_{ij})\bigr)$, the correctly rounded double of the corrected
+integer value, where $\Delta$ is the integer carried by the two
+correction GEMMs. In particular, when every scaled entry is an integer,
+the residuals vanish, $\Delta = 0$, and the output is the correctly
+rounded true product; when that product is representable, the result is
+exact.
+\end{proposition}
+
+\begin{proof}
+Each stage is exact integer arithmetic. The three-limb residues are
+computed from the biased integer without rounding; each modular GEMM
+accumulates products of balanced residues bounded by $128$ in magnitude,
+so a single launch stays within int32 for $K < 2^{17}$ and the segmented
+path within its int32 residue accumulators, whose entries are bounded by
+$128$ per segment over at most $128$ segments. The balanced mixed-radix
+digits are the unique such representation of $P_{ij} \bmod \prod m_t$,
+and by Proposition~\ref{prop:range} that representative is $P_{ij}$. The
+grouped recombination and the correction addition are exact in 128-bit
+integer arithmetic within the $2^{126}$ cap, and the conversion folds the
+dropped tail into a sticky bit strictly below the round position, which
+preserves round-to-nearest-even. When the residuals vanish, both
+correction operands $q$ are identically zero, so $\Delta = 0$
+identically. The test suite witnesses the claim by bit equality against
+integer oracles, including the aligned worst case, a dyadic
+dynamic-range case, and, through the segmented path, $K = 200{,}000$.
+\end{proof}
+
+\begin{proposition}[Accuracy after correction]\label{prop:accuracy}
+Let $S_{ij} = \sum_k (a_{ik} 2^{\sigma_i}) (b_{kj} 2^{\tau_j})$ be the
+exact scaled product and $V_{ij} = P_{ij} + 2^{b_e-15} \Delta_{ij}$ the
+corrected value. With the eight-bit summaries clamped to $[-127, 127]$,
+\[
+  |V_{ij} - S_{ij}|
+  \;\le\; K \Bigl( 3 \cdot 2^{b_e - 8} + 2^{b_e - 15} + \tfrac14 \Bigr),
+\]
+and the returned double adds one rounding at the output scale. Without
+the correction GEMMs the corresponding bound is $K \cdot 2^{b_e}$, so
+the correction is worth seven bits in the worst case.
+\end{proposition}
+
+\begin{proof}
+Write $S - P = \sum_k (\tilde{a} r^B + r^A \tilde{b} + r^A r^B)$
+element-wise. The summaries satisfy $h = \tilde{a} 2^{7 - b_e} + e_h$ and
+$q = r 2^{8} + e_q$, where rounding alone gives $|e| \le \tfrac12$ and
+the clamp at $\pm 127$ raises the bound to $|e| \le \tfrac32$ (the
+unclamped values reach $\pm 128$). Expanding one correction pair,
+\[
+  2^{b_e - 15} h_a q_b
+  \;=\; \tilde{a}\, r^B
+  \;+\; \tilde{a}\, 2^{-8} e_q
+  \;+\; e_h\, r^B\, 2^{b_e - 7}
+  \;+\; e_h e_q\, 2^{b_e - 15},
+\]
+whose error terms are bounded by $\tfrac32 \cdot 2^{b_e - 8}$,
+$\tfrac34 \cdot 2^{b_e - 7}$, and $\tfrac94 \cdot 2^{b_e - 15}$
+respectively; the symmetric pair contributes the same, and the
+uncorrected second-order term is $|r^A r^B| \le \tfrac14$. Summing over
+$K$ terms and collecting constants gives the stated bound. Without the
+correction the first-order term alone contributes up to
+$2 \cdot 2^{b_e - 1} = 2^{b_e}$ per term.
+\end{proof}
+
+The bound explains the measured behavior: at $b_e$ near $53$ the
+corrected worst case sits roughly seven bits below the uncorrected
+ceiling, and the four to five bits observed on random data
+(Section~\ref{sec:accuracy}) are the root-mean-square realization of it.
+The clamp affects only entries whose residual magnitude exceeds
+$\tfrac{255}{512}$ and costs at most a factor of three in the dominant
+constant.
 
 \section{The Engine and Its Dispatch}\label{sec:engine}
 
@@ -543,19 +638,27 @@ We measure on five NVIDIA architectures: GeForce RTX 3070 Ti Laptop
 6000 Blackwell Server Edition (SM~12.0), A100-SXM4-80GB (datacenter
 Ampere, SM~8.0), and H200 (Hopper, SM~9.0). The first three throttle FP64
 to $1/64$ of the FP32 rate; the last two do not, and the results divide
-along exactly that line. The two locally held RTX parts were measured
-under repeated best-of discipline; the Blackwell, A100, and H200 numbers
-come from cloud instances. Throughput is reported as $2n^3$ over the
-median of timed executions after warm-up; native FP64 is
-\code{torch.matmul} on the same tensors. The first call at a new problem
+along exactly that line. Throughput is reported as $2n^3$ over the median
+of 3 to 30 timed executions after warm-up, with iteration counts scaling
+inversely with size; on the two locally held parts, which are thermally
+variable, contending systems are additionally interleaved across repeated
+rounds and each cell reports its best median. The Blackwell, A100, and
+H200 numbers come from cloud instances. Native FP64 is
+\code{torch.matmul} on the same tensors. Software per part: consumer
+Ampere runs driver 580.126.09 with torch 2.7.1 on CUDA 12.6; Ada runs
+torch 2.10.0 on CUDA 12.6 under Windows; the Blackwell, A100, and H200
+instances run torch 2.8.0 on CUDA 12.9, 2.10.0 on CUDA 12.8, and 2.8.0
+on CUDA 12.9 respectively. \gemmul{} is built at its revision
+\code{6bf409b}. The first call at a new problem
 shape additionally runs the dispatch probe and costs six to twelve times
 the steady-state call (16.6 ms against 1.41 ms at $n = 2048$ on Ada), and
 all timings exclude it. Accuracy is reported as correct bits, $-\log_2$
 of the max-norm relative error against a reference accumulated in
 double-double arithmetic and cross-checked against exact rational
-arithmetic. The accuracy tables use $M = N = 128$; a spot check at
-$512 \times 4096 \times 512$ reproduces the pattern (native 49.4 bits,
-default 53.2, reduced 44.6).
+arithmetic. The accuracy tables use $M = N = 128$: the error of both
+systems is driven by the inner dimension $K$, not by the output extent,
+and a spot check at $512 \times 4096 \times 512$ reproduces the pattern
+(native 49.4 bits, default 53.2, reduced 44.6).
 
 \gemmul{} is built from source and measured on the same hardware in every
 comparison: through its direct interface compiled natively on Windows for
@@ -581,6 +684,46 @@ FP64 runs at $1/64$ rate, against $1.13\times$ on A100 and $1.02\times$
 on H200, whose FP64 units are unthrottled and where emulation pays only
 at scale. Below $n \approx 128$ per-call cost exceeds native on every
 part; CUDA-graph replay moves this crossover to $n = 64$ on SM~8.9.
+Figure~\ref{fig:sweep} plots the sweep on the three throttled parts.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{loglogaxis}[
+  width=0.86\textwidth, height=6.4cm,
+  xlabel={$n$}, ylabel={TFLOP/s},
+  log basis x=2,
+  xtick={512,1024,2048,4096,8192,16384},
+  xticklabels={512,1024,2048,4096,8192,16384},
+  legend pos=south east,
+  legend style={font=\scriptsize},
+  grid=major, grid style={dotted}
+]
+\addplot+[mark=*] coordinates
+  {(1024,11.40) (2048,21.76) (4096,32.40) (8192,39.89) (16384,39.95)};
+\addlegendentry{Blackwell, \fpemu{}}
+\addplot+[mark=square*] coordinates
+  {(512,2.85) (1024,8.28) (2048,12.71) (4096,13.56) (8192,14.92) (16384,14.63)};
+\addlegendentry{Ada, \fpemu{}}
+\addplot+[mark=triangle*] coordinates
+  {(512,0.94) (1024,2.10) (2048,3.58) (4096,3.65) (8192,4.45)};
+\addlegendentry{consumer Ampere, \fpemu{}}
+\addplot+[dashed, mark=none, black] coordinates
+  {(1024,1.37) (2048,1.51) (4096,1.52) (8192,1.53) (16384,1.53)};
+\addlegendentry{Blackwell, native}
+\addplot+[dashed, mark=none, gray] coordinates
+  {(512,1.03) (1024,1.10) (2048,1.13) (4096,1.30) (8192,1.31) (16384,1.33)};
+\addlegendentry{Ada, native}
+\addplot+[dashed, mark=none, lightgray] coordinates
+  {(512,0.20) (1024,0.21) (2048,0.26) (4096,0.28) (8192,0.28)};
+\addlegendentry{consumer Ampere, native}
+\end{loglogaxis}
+\end{tikzpicture}
+\caption{Default-configuration throughput against native FP64 on the
+three FP64-throttled parts. Solid: \fpemu{}; dashed: native
+\code{torch.matmul}.}
+\label{fig:sweep}
+\end{figure}
 
 \begin{table}[t]
 \centering
@@ -654,7 +797,9 @@ bits & 48.1 / 46.3 & 52.3 / 50.2 & 53.0 / 52.7 & 53.0 / 53.3 & 53.0 / 53.2 \\
 \begin{table}[t]
 \centering
 \caption{Equal-GEMM-count throughput in TFLOP/s on the three
-FP64-throttled architectures. Ratios are \fpemu{} over \gemmul{}.}
+FP64-throttled architectures. Ratios are \fpemu{} over \gemmul{}. Dashes:
+$n = 16384$ exceeds the 8 GB consumer part; the two smallest Blackwell
+cells were not captured on the metered instance.}
 \label{tab:gemmul8}
 \small
 \setlength{\tabcolsep}{4.5pt}
@@ -664,12 +809,12 @@ FP64-throttled architectures. Ratios are \fpemu{} over \gemmul{}.}
 \cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}
 $n$ & ours & \gemmul{} & ratio & ours & \gemmul{} & ratio & ours & \gemmul{} & ratio \\
 \midrule
-512 & 0.94 & 0.64 & $1.47$ & 2.85 & 0.75 & $3.80$ & & & \\
-1024 & 2.10 & 1.43 & $1.47$ & 8.28 & 4.40 & $1.88$ & & & \\
+512 & 0.94 & 0.64 & $1.47$ & 2.85 & 0.75 & $3.80$ & -- & -- & -- \\
+1024 & 2.10 & 1.43 & $1.47$ & 8.28 & 4.40 & $1.88$ & -- & -- & -- \\
 2048 & 3.58 & 2.27 & $1.58$ & 12.71 & 9.46 & $1.34$ & 21.76 & 13.14 & $1.66$ \\
 4096 & 3.65 & 3.14 & $1.16$ & 13.56 & 12.20 & $1.11$ & 32.40 & 20.65 & $1.57$ \\
 8192 & 4.45 & 3.80 & $1.17$ & 14.92 & 13.78 & $1.08$ & 39.89 & 30.78 & $1.30$ \\
-16384 & & & & 14.63 & 13.72 & $1.07$ & 39.95 & 34.88 & $1.15$ \\
+16384 & -- & -- & -- & 14.63 & 13.72 & $1.07$ & 39.95 & 34.88 & $1.15$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -721,6 +866,26 @@ to the extra GEMM; pinning thirteen moduli at that depth restores parity,
 $17.28$ against $17.60$ TF, which localizes the deficit to the modulus
 count rather than to any per-GEMM inefficiency.
 
+\subsection{Component ablations}\label{sec:ablation}
+
+Three of the contributions can be isolated. \emph{Sizing:} worst-case
+provisioning for a 53-bit guarantee at $K = 4096$ requires sixteen moduli
+(Section~\ref{sec:sizing}), eighteen GEMMs with the correction pair; the
+runtime pass delivers 53.1 to 54.1 bits from fourteen moduli, sixteen
+GEMMs, on all six distributions of Table~\ref{tab:accuracy}, a saving of
+two GEMMs, narrowing to one at $K = 16384$. \emph{Engine:} pinning the
+dispatch to one engine with everything else fixed separates the fused
+kernel from cuBLAS. On Ada in a single interleaved sweep, the fused
+engine delivers 7.34 against 5.30 TFLOP/s at $n = 1024$ and 12.52 against
+11.39 at $n = 2048$, while the two agree within one percent at
+$n = 8192$ (15.77 against 15.61); on consumer Ampere the ordering
+inverts at large sizes, where the cuBLAS form leads by ten percent. No
+fixed rule captures both parts, which is what the measured dispatch
+replaces. \emph{Reconstruction:} the register-resident grouped form of
+Section~\ref{sec:recon} is a component-level $1.6\times$ on SM~8.6 and
+$1.4\times$ on SM~8.9 over the per-modulus 128-bit recurrence it
+replaced.
+
 \subsection{Accuracy}\label{sec:accuracy}
 
 Table~\ref{tab:accuracy} reports correct bits on six input distributions
@@ -734,24 +899,27 @@ $2^{30}$ spike element per row.
 \begin{table}[t]
 \centering
 \caption{Correct bits against a double-double reference, $M = N = 128$.
-The default exceeds native FP64 DGEMM in every cell.}
+Native, default, and reduced are measured on the Blackwell part;
+\gemmul{} at sixteen moduli is measured through its hook on consumer
+Ampere, the reconstruction being architecture-independent. The default
+exceeds native FP64 DGEMM in every cell.}
 \label{tab:accuracy}
-\begin{tabular}{lrrrr}
+\begin{tabular}{lrrrrr}
 \toprule
-distribution & $K$ & native & default & reduced \\
+distribution & $K$ & native & default & reduced & \gemmul{} \\
 \midrule
-randn & 512 & 49.4 & 53.4 & 45.9 \\
-randn & 4096 & 47.6 & 53.6 & 44.3 \\
-wide8 & 512 & 49.4 & 53.7 & 46.2 \\
-wide8 & 4096 & 47.6 & 53.7 & 45.1 \\
-wide16 & 512 & 49.4 & 53.3 & 46.8 \\
-wide16 & 4096 & 48.1 & 53.7 & 45.2 \\
-illcond & 512 & 49.1 & 53.7 & 47.1 \\
-illcond & 4096 & 47.7 & 53.3 & 45.4 \\
-illcond40 & 512 & 49.6 & 53.6 & 48.6 \\
-illcond40 & 4096 & 48.0 & 53.5 & 46.9 \\
-spike & 512 & 48.7 & 54.0 & 45.7 \\
-spike & 4096 & 47.8 & 53.2 & 43.3 \\
+randn & 512 & 49.4 & 53.4 & 45.9 & 52.7 \\
+randn & 4096 & 47.6 & 53.6 & 44.3 & 53.0 \\
+wide8 & 512 & 49.4 & 53.7 & 46.2 & 52.9 \\
+wide8 & 4096 & 47.6 & 53.7 & 45.1 & 52.5 \\
+wide16 & 512 & 49.4 & 53.3 & 46.8 & 53.2 \\
+wide16 & 4096 & 48.1 & 53.7 & 45.2 & 52.8 \\
+illcond & 512 & 49.1 & 53.7 & 47.1 & 53.2 \\
+illcond & 4096 & 47.7 & 53.3 & 45.4 & 52.6 \\
+illcond40 & 512 & 49.6 & 53.6 & 48.6 & 52.9 \\
+illcond40 & 4096 & 48.0 & 53.5 & 46.9 & 52.9 \\
+spike & 512 & 48.7 & 54.0 & 45.7 & 53.3 \\
+spike & 4096 & 47.8 & 53.2 & 43.3 & 52.7 \\
 \bottomrule
 \end{tabular}
 \end{table}

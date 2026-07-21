@@ -1,0 +1,23 @@
+[general]
+name = "fp64-emu"
+version = 1
+edition = 5
+license = "Apache-2.0"
+backends = [
+  "cuda",
+]
+
+[general.hub]
+repo-id = "phanerozoic/fp64-emu"
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[kernel.fp64-emu]
+backend = "cuda"
+cuda-capabilities = ["8.0", "8.6", "8.9", "9.0", "10.0", "12.0"]
+depends = ["torch"]
+src = ["fp64_emu_cuda/fp64_emu.cu"]

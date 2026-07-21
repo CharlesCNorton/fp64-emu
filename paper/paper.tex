@@ -114,9 +114,9 @@ one pass fused with the scaling pass, and applies the Cauchy--Schwarz
 inequality to bound the actual product: whatever residue range the data
 leaves unused is converted into additional operand mantissa bits, and when
 the data needs more range than the configured moduli provide, the operands
-are narrowed instead. The consequence is a scheme in which every modulus
-count is unconditionally safe. Adversarial input costs correct bits; it
-cannot corrupt the answer.
+are narrowed instead. The consequence is a scheme in which every
+configuration the library plans is safe. Adversarial input costs correct
+bits; it cannot corrupt the answer.
 
 \emph{Integer-only extraction with first-order correction
 (Section~\ref{sec:extract}).} The pass that converts scaled doubles into
@@ -216,9 +216,9 @@ additional INT8 GEMM to compute the bound exactly and reduce the scaling
 overestimate. We adopt from \gemmul{} its modulus table, whose composite
 entries ($255 = 3 \cdot 5 \cdot 17$, $253$, $247$, $217$) carry nearly
 eight bits each where primes alone would carry fewer; balanced residues
-make the ceiling $256$ rather than $128$, since the symmetric
-representative range $[-(m-1)/2, m/2]$ of $m = 256$ lands exactly on the
-INT8 domain.
+make the ceiling $256$ rather than $128$, since for even $m$ the
+balanced representatives lie in $[-m/2,\, m/2 - 1]$, which at $m = 256$
+is exactly the signed eight-bit range $[-128, 127]$.
 
 \subsection{Other emulation paths}
 
@@ -311,12 +311,18 @@ single effective width $b_{\mathrm{eff}} = b + g$.
 
 Two consequences follow. First, on typical data the default configuration
 recovers the full 53-bit significand with fewer moduli than the worst-case
-rule would demand, because the measured bound sits near
-$\log_2 K / 2 + 2b$ rather than $\log_2 K + 2b$. Second, and more
-important for robustness, $g$ may be negative: if the caller provisions
-fewer moduli than the data requires, the operands are narrowed until the
-bound fits. Every modulus count is therefore unconditionally range-safe,
-and the count becomes a pure accuracy-versus-speed knob. \gemmul{}'s fast
+rule would demand: for dense Gaussian rows the norm-product bound scales
+as $2b + \log_2 K - \log_2(2 \ln K)$, about $2b + 8$ at $K = 4096$
+against the worst-case $2b + \log_2 K$, and for rows dominated by a few
+large entries the saving approaches the full $\log_2 K$;
+Section~\ref{sec:ablation} quantifies what the pass delivers. Second, and
+more important for robustness, $g$ may be negative: if the caller
+provisions fewer moduli than the data requires, the operands are narrowed
+until the bound fits. Narrowing is bounded below by the width floor
+$b_e \ge 16$ discussed with Proposition~\ref{prop:range}; every modulus
+count above that floor's envelope, including every count the planner
+emits, is range-safe, and the count becomes a pure
+accuracy-versus-speed knob. \gemmul{}'s fast
 mode also invokes Cauchy--Schwarz, but for a different purpose, estimating
 the output magnitude to set its scaling constant against a fixed width;
 there, an overestimate costs accuracy. Here the inequality allocates the
@@ -350,10 +356,11 @@ residue follows by
   r \;=\; \bigl(\ell_2 c_{36} + \ell_1 c_{18} + \ell_0 + c_b\bigr) \bmod m,
   \qquad c_{36} = 2^{36} \bmod m,\; c_{18} = 2^{18} \bmod m,
 \]
-with $c_b$ chosen to cancel the bias inside the sum. The limb sum stays
-below $2^{26}$, so a single 32-bit Barrett multiplication with one
-conditional subtraction reduces it; no 64-bit multiply-high appears
-anywhere in the pass. The integer formulation is also exact where an
+with $c_b$ chosen to cancel the bias inside the sum. Each limb product
+stays below $2^{26}$ and the limb sum below $2^{27}$, so the Barrett
+quotient underestimates the true quotient by at most one and a single
+conditional subtraction completes the reduction; no 64-bit multiply-high
+appears anywhere in the pass. The integer formulation is also exact where an
 underflowing \code{ldexp} would round. Measured in isolation, the pass
 runs at 92\% of DRAM bandwidth on SM~8.6.
 
@@ -401,8 +408,8 @@ classical CRT sum that Ozaki-II uses. The mixed-radix digits
   \, (M_t \bmod m_t)^{-1} \bmod m_t,
   \qquad M_u = \prod_{v<u} m_v,
 \]
-computed in the balanced representative range, are bounded by $m_t/2$ and
-therefore fit signed bytes, and every factor $M_u \bmod m_t$ can be
+computed in the balanced representative range $[-m_t/2,\, m_t/2)$, fit
+signed bytes, and every factor $M_u \bmod m_t$ can be
 re-balanced to a byte as well without leaving its congruence class. The
 inner product of the recurrence then becomes a dot product of two
 byte-vectors, which GPUs execute four lanes at a time by the \code{dp4a}
@@ -418,9 +425,11 @@ naive form costs one 128-bit multiply-add per modulus, and profiling on
 SM~8.6 showed the kernel bound on the pipe that executes wide integer
 multiplies. We collapse the evaluation into groups: a Horner pass over at
 most seven moduli stays below $2^{55}$ and runs in plain 64-bit registers,
-and the groups combine high to low with a single wide multiply each,
-$P = a_0 + M_{0..6}\,(a_1 + M_{7..13}\, a_2)$. Two wide multiplies replace
-thirteen 128-bit steps at the default modulus count. A register-residency
+and the groups combine high to low with a single wide multiply each, in
+the three-group form $P = a_0 + M_{0..6}\,(a_1 + M_{7..13}\, a_2)$. At
+the default fourteen moduli two groups suffice, so one wide multiply
+replaces thirteen 128-bit steps; counts above fourteen engage the third
+group and a second multiply. A register-residency
 constraint completes the design: both digit loops unroll to the
 compile-time modulus maximum and exit at the runtime count, because any
 runtime-indexed thread-local array is demoted to local memory, which we
@@ -479,6 +488,16 @@ $\log_2 (\|\tilde{a}_{i,:}\| \|\tilde{b}_{:,j}\|) \le \lambda_A +
 \lambda_B + \tfrac12 \le \log_2 M^{*} - 1$.
 \end{proof}
 
+The implementation floors $b_e$ at $16$, since the correction scale
+$2^{b_e - 15}$ must remain a positive shift, and does not re-check the
+margin once the floor binds. The hypothesis therefore has to be
+satisfiable at the floor: a 16-bit worst-case product needs
+$33 + \lceil \log_2 K \rceil$ bits of range, which seven moduli provide
+at every single-launch depth and eight at the segmented maximum, and the
+planner never emits fewer than thirteen. Only a hand-set count below
+that envelope can drive the floor into violation; there the hypothesis
+fails and the reconstruction can wrap.
+
 \begin{proposition}[Exactness]\label{prop:exact}
 Under Proposition~\ref{prop:range}, the exact path returns
 $\mathrm{RN}\bigl(2^{-\sigma_i - \tau_j} (P_{ij} + 2^{b_e - 15}
@@ -515,11 +534,13 @@ exact scaled product and $V_{ij} = P_{ij} + 2^{b_e-15} \Delta_{ij}$ the
 corrected value. With the eight-bit summaries clamped to $[-127, 127]$,
 \[
   |V_{ij} - S_{ij}|
-  \;\le\; K \Bigl( 3 \cdot 2^{b_e - 8} + 2^{b_e - 15} + \tfrac14 \Bigr),
+  \;\le\; K \Bigl( 3 \cdot 2^{b_e - 7} + \tfrac92 \cdot 2^{b_e - 15}
+  + \tfrac14 \Bigr),
 \]
 and the returned double adds one rounding at the output scale. Without
 the correction GEMMs the corresponding bound is $K \cdot 2^{b_e}$, so
-the correction is worth seven bits in the worst case.
+the correction is worth a factor of $128/3$, about $5.4$ bits, in the
+worst case.
 \end{proposition}
 
 \begin{proof}
@@ -537,17 +558,18 @@ unclamped values reach $\pm 128$). Expanding one correction pair,
 \]
 whose error terms are bounded by $\tfrac32 \cdot 2^{b_e - 8}$,
 $\tfrac34 \cdot 2^{b_e - 7}$, and $\tfrac94 \cdot 2^{b_e - 15}$
-respectively; the symmetric pair contributes the same, and the
-uncorrected second-order term is $|r^A r^B| \le \tfrac14$. Summing over
-$K$ terms and collecting constants gives the stated bound. Without the
-correction the first-order term alone contributes up to
+respectively, totaling $3 \cdot 2^{b_e-8} + \tfrac94 \cdot 2^{b_e-15}$
+for one pair; the symmetric pair contributes the same, doubling both
+constants, and the uncorrected second-order term adds
+$|r^A r^B| \le \tfrac14$. Summing over $K$ terms gives the stated bound.
+Without the correction the first-order term alone contributes up to
 $2 \cdot 2^{b_e - 1} = 2^{b_e}$ per term.
 \end{proof}
 
-The bound explains the measured behavior: at $b_e$ near $53$ the
-corrected worst case sits roughly seven bits below the uncorrected
-ceiling, and the four to five bits observed on random data
-(Section~\ref{sec:accuracy}) are the root-mean-square realization of it.
+The bound explains the measured behavior: the corrected worst case sits
+about five and a half bits below the uncorrected ceiling, and the four
+to five bits observed on random data (Section~\ref{sec:accuracy})
+realize most of that margin.
 The clamp affects only entries whose residual magnitude exceeds
 $\tfrac{255}{512}$ and costs at most a factor of three in the dominant
 constant.
@@ -979,9 +1001,25 @@ configurations, and both share identical gather and scatter code. On Ada
 at $n = 16384$ the update phase drops from $1.23$ to $0.69$ seconds and
 the whole factorization from $1.43$ to $0.94$ seconds, a $1.5\times$
 end-to-end speedup; consumer Ampere at $n = 8192$ moves from $0.83$ to
-$0.56$ seconds. The factorization residuals
+$0.56$ seconds. The non-update remainder differs slightly between the
+configurations, $0.20$ against $0.25$ seconds on Ada, reflecting
+allocator and cache state left by the different update engines rather
+than any difference in the shared code. The factorization residuals
 $\|A - LL^{\top}\|_F / \|A\|_F$ are equal between the two engines at
 $3$ to $4 \times 10^{-16}$.
+
+\subsection{Energy}\label{sec:energy}
+
+Board power sampled by \code{nvidia-smi} during sustained loops converts
+the throughput advantage into an energy one. On Ada at $n = 8192$,
+native FP64 draws 180 W for 840 ms per product, 151.6 J per GEMM, while
+the default configuration draws 297 W for 83 ms, 24.7 J per GEMM: the
+emulation pulls 65 percent more power and finishes ten times sooner, so
+it is $6.1\times$ more energy-efficient, 44.5 against 7.3 GFLOP per
+joule. The asymmetry in draw is itself informative: the throttled FP64
+pipe cannot fill the machine and leaves the board underdrawn, while the
+emulation runs the tensor cores at the full power envelope and still
+wins on energy by finishing an order of magnitude sooner.
 
 \subsection{NVIDIA's cuBLAS FP64 emulation}\label{sec:cublasemu}
 

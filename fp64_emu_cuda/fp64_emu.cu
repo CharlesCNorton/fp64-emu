@@ -45,7 +45,7 @@ __device__ __forceinline__ int barrett_bal32(int y, int p, uint32_t mu32, uint32
   uint32_t r = xu - q * (uint32_t)p;
   while (r >= (uint32_t)p) r -= (uint32_t)p;
   int rb = (int)r;
-  // Balance to [-(p-1)/2, p/2]; at p = 256 this maps 128 to -128, which int8 holds.
+  // Balance to [-p/2, (p-1)/2] under integer division; p = 256 gives [-128, 127].
   if (rb > (p - 1) / 2) rb -= p;
   return rb;
 }
@@ -272,9 +272,9 @@ __global__ void extract_kernel(const double* __restrict__ Ain, const double* __r
     s_cb[t0] = p - (uint32_t)(((uint64_t)1 << bits) % p);
   }
   __syncthreads();
-  // Balanced residue from the three 18-bit limbs of (t + 2^bits); the limb
-  // sum is under 2^26, so q underestimates v/p by at most one and a single
-  // conditional subtract completes the 32-bit Barrett.
+  // Balanced residue from the three 18-bit limbs of (t + 2^bits); each limb
+  // product is under 2^26 and the sum under 2^27, so q underestimates v/p by
+  // at most one and a single conditional subtract completes the 32-bit Barrett.
   auto residue = [&](uint32_t a, uint32_t b, uint32_t c, int pi) -> signed char {
     const uint32_t p = (uint32_t)s_p[pi];
     const uint32_t v = a * s_c36[pi] + b * s_c18[pi] + c + s_cb[pi];
@@ -982,7 +982,7 @@ static void build_recon_tables(const int* primes, int P, std::vector<int>& mppac
     for (int u = 0; u < P; u++) {
       if (u == t) minv[t] = modinv_host((int)run, (int)pt);   // (M_t mod p_t)^{-1}
       if (u < t) {
-        int bal = (int)run;                     // balance to [-(p-1)/2 .. p/2]
+        int bal = (int)run;                     // balance to [-p/2, (p-1)/2]
         if (bal > ((int)pt - 1) / 2) bal -= (int)pt;
         mppack[(size_t)t * MPGROUPS + (u >> 2)] |=
             ((int)(unsigned char)(signed char)bal) << ((u & 3) * 8);

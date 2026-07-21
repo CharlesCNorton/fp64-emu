@@ -77,9 +77,9 @@ planes, adds the quantization correction, and rescales. The modulus count is
 linear in the target precision (Ozaki-II / CRT), against the quadratic slice
 count of mantissa-slicing schemes. Four properties set the cost:
 
-- Balanced residues in `[-(m-1)/2, m/2]` admit moduli to 256, so the
-  composites 255, 253, 247 and 217 join the primes at nearly 8 bits each,
-  worth about a fifth fewer GEMMs than primes alone.
+- Balanced residues admit moduli to 256 (`[-128, 127]` at `m = 256`), so
+  the composites 255, 253, 247 and 217 join the primes at nearly 8 bits
+  each, worth about a fifth fewer GEMMs than primes alone.
 - Operands are sized by the Cauchy-Schwarz bound
   `max_i‖A_i‖₂ · max_j‖B_j‖₂` rather than the worst case. Unused CRT range
   becomes mantissa bits, and adversarial input narrows the result rather than

@@ -25,7 +25,7 @@ reconstructed from the residues by the Chinese Remainder Theorem. The result is
 a drop-in float64 `mm` that is an order of magnitude faster than native FP64
 wherever FP64 is throttled, and at least as accurate everywhere.
 
-![Residue planes stacking into a tower while the error field burns down and a correct-bits meter passes the native FP64 mark](https://huggingface.co/kernels/phanerozoic/fp64-emu/resolve/main/media/hero.gif)
+![Residue planes stacking into a tower while the error field burns down and a correct-bits meter passes the native FP64 mark](media/hero.gif)
 
 *One INT8 GEMM per modulus: each residue plane lands, the per-element error
 against a ~106-bit double-double reference burns down, and the correct-bits
